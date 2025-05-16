@@ -1,0 +1,92 @@
+name: AWS Connection Test
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  test-aws-connection:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v3
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Build with Gradle
+        run: ./gradlew test
+
+      - name: Build Docker image
+        run: docker build -t guestbook-practice:latest .
+
+      - name: Set environment variables
+        run: |
+          echo "ECR_REGISTRY=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com" >> $GITHUB_ENV
+          echo "ECR_REPOSITORY=guestbook-practice" >> $GITHUB_ENV
+          echo "IMAGE_TAG=$(date +'%Y%m%d%H%M%S')-${GITHUB_SHA::8}" >> $GITHUB_ENV
+
+      - name: Tag Docker image
+        run: |
+          docker tag guestbook-practice:latest ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+          docker tag guestbook-practice:latest ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest
+          
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_DEPLOY_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_DEPLOY_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Push Docker image to Amazon ECR
+        run: |
+          docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+          docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest
+
+      - name: Download task definition
+        run: |
+          aws ecs describe-task-definition --task-definition guestbook-practice-app2-task --query taskDefinition > task-definition.json
+
+      - name: Update task definition with new image
+        id: render-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+            task-definition: task-definition.json
+            container-name: guestbook-app
+            image: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+
+      - name: Print task definition
+        run: |
+          echo ${{ steps.render-task-def.outputs.task-definition }}
+
+      - name: Deploy to Amazon ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-task-def.outputs.task-definition }}
+          service: guestbook-practice-app2-task-service-c22dvucp
+          cluster: my-guestbook-app
+          wait-for-service-stability: true
+
+      - name: Verify deployment
+        run: |
+          echo "Verifying deployment..."
+          SERVICE_STATUS=$(aws ecs describe-services --cluster my-guestbook-app --services guestbook-practice-app2-task-service-c22dvucp --query 'services[0].status' --output text)
+        
+          if [ "$SERVICE_STATUS" = "ACTIVE" ]; then
+            echo "Deployment successful! Service is active."
+          else
+            echo "Deployment may have issues. Service status: $SERVICE_STATUS"
+            exit 1
+          fi
+
+        # 더 상세한 검증은 추가 스크립트로 구현 가능
